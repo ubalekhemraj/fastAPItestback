@@ -1,6 +1,42 @@
 # fastAPItestback
 
-A FastAPI project that demonstrates **synchronous** and **asynchronous** service patterns with Docker, designed for deployment on **AWS ECS (Fargate)**.
+A single **async FastAPI** application with a **persistent background worker**, containerised with Docker and ready for deployment on **AWS ECS Fargate**.
+
+---
+
+## How It Works
+
+The app runs as one process inside one Docker container (one ECS task):
+
+```
+ECS Fargate Task: fastapi-app
+└── uvicorn (single process, async event loop)
+    ├── HTTP endpoints  — handle requests without blocking the event loop
+    └── Background worker loop  — drains task_queue concurrently in the same event loop
+```
+
+### Background task flow
+
+```
+Client                    FastAPI App                  Background Worker
+  │                           │                               │
+  │  POST /task               │                               │
+  │ ─────────────────────────►│                               │
+  │                           │  queue.put(task_id, ...)      │
+  │  202 Accepted (instant)   │ ──────────────────────────────│
+  │ ◄─────────────────────────│                               │
+  │                           │             await asyncio.sleep(duration)
+  │                           │                               │ (non-blocking)
+  │  GET /task/{task_id}      │                               │
+  │ ─────────────────────────►│                               │
+  │  {"status": "running"…}   │                               │
+  │ ◄─────────────────────────│                               │
+  │                           │    task_results[id] = done    │
+  │  GET /task/{task_id}      │ ◄─────────────────────────────│
+  │ ─────────────────────────►│                               │
+  │  {"status": "completed"…} │                               │
+  │ ◄─────────────────────────│                               │
+```
 
 ---
 
@@ -8,176 +44,104 @@ A FastAPI project that demonstrates **synchronous** and **asynchronous** service
 
 ```
 .
-├── sync_service/          # Synchronous FastAPI service (port 8000)
-│   ├── main.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── async_service/         # Asynchronous FastAPI service with background tasks (port 8001)
-│   ├── main.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── ecs/                   # ECS Fargate task definitions
-│   ├── sync-task-definition.json
-│   └── async-task-definition.json
-└── docker-compose.yml     # Local development
+├── main.py               # Single async FastAPI app + background worker
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml    # Local development
+└── ecs/
+    └── task-definition.json   # ECS Fargate task definition
 ```
 
 ---
 
-## Services
+## Endpoints
 
-### Sync Service (port 8000)
-
-Handles requests using regular blocking Python functions (`def`). Uses `time.sleep()` to simulate blocking I/O (e.g., a synchronous database call). On ECS, you scale horizontally by adding more replicas because each worker thread is blocked while processing a request.
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/` | GET | Service info |
-| `/health` | GET | ECS health check |
-| `/task` | POST | Run a blocking sync task |
-| `/items/{item_id}` | GET | Fetch an item (blocking DB simulation) |
-
-### Async Service (port 8001)
-
-Handles requests using `async def` coroutines. Long-running work is offloaded to **FastAPI BackgroundTasks** — the HTTP response is returned immediately (202 Accepted) and the task runs in the background. Uses `asyncio.sleep()` so the event loop is never blocked, enabling high concurrency with a single process.
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/` | GET | Service info |
-| `/health` | GET | ECS health check |
-| `/task` | POST | Submit a background task (returns 202 immediately) |
-| `/task/{task_id}` | GET | Poll background task status |
-| `/items/{item_id}` | GET | Fetch an item (non-blocking async simulation) |
-
----
-
-## Sync vs Async — Key Difference
-
-| | Sync Service | Async Service |
-|---|---|---|
-| Function type | `def` (blocking) | `async def` (non-blocking) |
-| Sleep | `time.sleep()` | `asyncio.sleep()` |
-| Response time | Waits for work to complete | Returns immediately (202) |
-| Concurrency | Multiple workers / replicas | Single process, event loop |
-| Best for | CPU-bound / legacy blocking code | I/O-bound / high-concurrency |
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Service info |
+| `GET` | `/health` | ECS health check (includes queue size) |
+| `POST` | `/task` | Submit a task — returns **202 immediately** |
+| `GET` | `/task/{task_id}` | Poll task status (`queued` → `running` → `completed`) |
+| `GET` | `/items/{item_id}` | Async item lookup (`?description=true` for details) |
 
 ---
 
 ## Running Locally with Docker Compose
 
 ```bash
-# Build and start both services
 docker-compose up --build
-
-# Sync service
-curl http://localhost:8000/health
-curl http://localhost:8000/items/1
-curl -X POST http://localhost:8000/task \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-sync-task", "duration_seconds": 2}'
-
-# Async service
-curl http://localhost:8001/health
-curl http://localhost:8001/items/1
-
-# Submit a background task (returns immediately with task_id)
-curl -X POST http://localhost:8001/task \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-async-task", "duration_seconds": 5}'
-
-# Poll status using the task_id from the previous response
-curl http://localhost:8001/task/<task_id>
 ```
 
-**Interactive API docs** are available at:
-- Sync service: http://localhost:8000/docs
-- Async service: http://localhost:8001/docs
+Then exercise the app:
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Submit a background task (returns 202 immediately)
+curl -X POST http://localhost:8000/task \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-task", "duration_seconds": 5}'
+
+# Poll status using the task_id from the previous response
+curl http://localhost:8000/task/<task_id>
+
+# Async item lookup
+curl "http://localhost:8000/items/42?description=true"
+```
+
+Interactive API docs: http://localhost:8000/docs
 
 ---
 
-## Deploying to AWS ECS (Fargate)
+## Deploying to AWS ECS Fargate
 
-### 1. Push images to ECR
+### 1. Build and push the image to ECR
 
 ```bash
 # Authenticate
 aws ecr get-login-password --region YOUR_REGION | \
   docker login --username AWS --password-stdin YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com
 
-# Create ECR repositories
-aws ecr create-repository --repository-name sync-service
-aws ecr create-repository --repository-name async-service
+# Create ECR repository
+aws ecr create-repository --repository-name fastapi-app
 
 # Build and push
-docker build -t sync-service ./sync_service
-docker tag sync-service:latest YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/sync-service:latest
-docker push YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/sync-service:latest
-
-docker build -t async-service ./async_service
-docker tag async-service:latest YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/async-service:latest
-docker push YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/async-service:latest
+docker build -t fastapi-app .
+docker tag fastapi-app:latest \
+  YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/fastapi-app:latest
+docker push \
+  YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/fastapi-app:latest
 ```
 
-### 2. Update task definitions
+### 2. Update the task definition
 
-Edit `ecs/sync-task-definition.json` and `ecs/async-task-definition.json`, replacing:
-- `YOUR_ACCOUNT_ID` with your AWS account ID
-- `YOUR_REGION` with your AWS region (e.g., `us-east-1`)
+Edit `ecs/task-definition.json`, replacing:
+- `YOUR_ACCOUNT_ID` → your AWS account ID
+- `YOUR_REGION` → your AWS region (e.g. `us-east-1`)
 
-### 3. Register task definitions
-
-```bash
-aws ecs register-task-definition --cli-input-json file://ecs/sync-task-definition.json
-aws ecs register-task-definition --cli-input-json file://ecs/async-task-definition.json
-```
-
-### 4. Create CloudWatch log groups
+### 3. Register the task definition and create the service
 
 ```bash
-aws logs create-log-group --log-group-name /ecs/sync-service
-aws logs create-log-group --log-group-name /ecs/async-service
-```
+# Create log group
+aws logs create-log-group --log-group-name /ecs/fastapi-app
 
-### 5. Create ECS services
+# Register task definition
+aws ecs register-task-definition \
+  --cli-input-json file://ecs/task-definition.json
 
-```bash
-# Create a cluster (if not already existing)
+# Create a cluster (if needed)
 aws ecs create-cluster --cluster-name fastapi-demo
 
-# Create the sync ECS service
+# Create the ECS service
 aws ecs create-service \
   --cluster fastapi-demo \
-  --service-name sync-service \
-  --task-definition sync-service \
-  --desired-count 2 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[YOUR_SUBNET],securityGroups=[YOUR_SG],assignPublicIp=ENABLED}"
-
-# Create the async ECS service
-aws ecs create-service \
-  --cluster fastapi-demo \
-  --service-name async-service \
-  --task-definition async-service \
+  --service-name fastapi-app \
+  --task-definition fastapi-app \
   --desired-count 1 \
   --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[YOUR_SUBNET],securityGroups=[YOUR_SG],assignPublicIp=ENABLED}"
+  --network-configuration \
+    "awsvpcConfiguration={subnets=[YOUR_SUBNET],securityGroups=[YOUR_SG],assignPublicIp=ENABLED}"
 ```
 
-> **Note:** The sync service benefits from `--desired-count 2` (or more) because each worker blocks during request processing. The async service can handle many concurrent requests with a single task due to the event loop.
-
----
-
-## How It Works on ECS
-
-```
-ECS Cluster: fastapi-demo
-├── Service: sync-service   (2 Fargate tasks, port 8000)
-│   └── Each task runs uvicorn with 4 workers
-│       Workers block on time.sleep() / DB calls
-│       Scale OUT (more tasks) for more throughput
-│
-└── Service: async-service  (1 Fargate task, port 8001)
-    └── Single uvicorn process, async event loop
-        Background tasks run concurrently without blocking
-        Scale UP (more CPU/memory) for heavier workloads
-```
+The single running Fargate task will serve HTTP traffic **and** continuously process background tasks — no second service needed.
